@@ -18,10 +18,10 @@ data class OffsetConfig(
             return OffsetConfig(
                 packageName = prefs.getString("packageName", "com.and.games505.TerrariaPaid")!!,
                 mainTypeInfoHex = prefs.getString("mainTypeInfoHex", "0x0")!!,
-                projectileFieldHex = prefs.getString("projectileFieldHex", "0x168")!!,
-                projAiStyleHex = prefs.getString("projAiStyleHex", "0x94")!!,
-                projAiArrayHex = prefs.getString("projAiArrayHex", "0xB8")!!,
-                projLocalAiArrayHex = prefs.getString("projLocalAiArrayHex", "0xC0")!!
+                projectileFieldHex = prefs.getString("projectileFieldHex", "0x5B8")!!,
+                projAiStyleHex = prefs.getString("projAiStyleHex", "0x98")!!,
+                projAiArrayHex = prefs.getString("projAiArrayHex", "0x78")!!,
+                projLocalAiArrayHex = prefs.getString("projLocalAiArrayHex", "0x84")!!
             )
         }
 
