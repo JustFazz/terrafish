@@ -23,26 +23,35 @@ import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
+import kotlin.math.abs
 
 class FloatingFishService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var controlView: LinearLayout
+    private lateinit var minimizedBubbleView: TextView
     private lateinit var tapTargetView: TextView
+
     private lateinit var controlParams: WindowManager.LayoutParams
+    private lateinit var bubbleParams: WindowManager.LayoutParams
     private lateinit var tapTargetParams: WindowManager.LayoutParams
 
     private lateinit var tvPidStatus: TextView
     private lateinit var tvTelemetry: TextView
     private lateinit var btnStartStop: Button
+    private lateinit var btnToggleFloating: Button
     private lateinit var cbCrateOnly: CheckBox
 
     @Volatile
     private var isAutoFishing = false
 
     @Volatile
+    private var isFloatingEnabled = true
+
+    @Volatile
     private var crateOnlyMode = false
 
+    private var isMinimized = false
     private var lastActionTime = 0L
     private var waitingForCastSettle = false
     private var catchCount = 0
@@ -89,28 +98,45 @@ class FloatingFishService : Service() {
         val overlayType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         val density = resources.displayMetrics.density
 
-        // 1. Panel Kontrol Floating
+        // 1. Panel Kontrol Floating (Expanded)
         controlView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(26, 20, 26, 20)
+            setPadding(24, 18, 24, 18)
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#D912161F"))
+                setColor(Color.parseColor("#E612161F"))
                 cornerRadius = 24f
                 setStroke(2, Color.parseColor("#00E676"))
             }
+        }
+
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
         }
 
         tvPidStatus = TextView(this).apply {
             text = "PID: Mencari Terraria..."
             setTextColor(Color.parseColor("#80CBC4"))
             textSize = 11f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
+
+        val btnMinimize = TextView(this).apply {
+            text = "  —  "
+            setTextColor(Color.parseColor("#00E5FF"))
+            textSize = 15f
+            setPadding(12, 0, 4, 0)
+            setOnClickListener { setMinimizedState(true) }
+        }
+
+        topBar.addView(tvPidStatus)
+        topBar.addView(btnMinimize)
 
         tvTelemetry = TextView(this).apply {
             text = "Bobber: IDLE | Total: 0"
             setTextColor(Color.WHITE)
             textSize = 12f
-            setPadding(0, 4, 0, 10)
+            setPadding(0, 4, 0, 8)
         }
 
         btnStartStop = Button(this).apply {
@@ -119,6 +145,14 @@ class FloatingFishService : Service() {
             setBackgroundColor(Color.parseColor("#2E7D32"))
             textSize = 12f
             setOnClickListener { toggleFishing() }
+        }
+
+        btnToggleFloating = Button(this).apply {
+            text = "FLOATING: ON"
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#1565C0"))
+            textSize = 11f
+            setOnClickListener { toggleFloatingOverlay() }
         }
 
         cbCrateOnly = CheckBox(this).apply {
@@ -131,16 +165,17 @@ class FloatingFishService : Service() {
         }
 
         val btnClose = TextView(this).apply {
-            text = "✕ Tutup Floating UI"
+            text = "✕ Tutup Service"
             setTextColor(Color.parseColor("#FF5252"))
             textSize = 11f
-            setPadding(0, 8, 0, 0)
+            setPadding(0, 6, 0, 0)
             setOnClickListener { stopSelf() }
         }
 
-        controlView.addView(tvPidStatus)
+        controlView.addView(topBar)
         controlView.addView(tvTelemetry)
         controlView.addView(btnStartStop)
+        controlView.addView(btnToggleFloating)
         controlView.addView(cbCrateOnly)
         controlView.addView(btnClose)
 
@@ -152,11 +187,38 @@ class FloatingFishService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 50
-            y = 100
+            x = 40
+            y = 90
         }
 
-        // 2. Titik Tap Lempar Kail (Geser ke area air saat STOP, otomatis tembus sentuhan saat START)
+        // 2. Tombol Bulat Minimize (Bubble)
+        val bubbleSize = (48 * density).toInt()
+        minimizedBubbleView = TextView(this).apply {
+            text = "FISH"
+            gravity = Gravity.CENTER
+            textSize = 10f
+            setTextColor(Color.WHITE)
+            visibility = View.GONE
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#D912161F"))
+                setStroke(3, Color.parseColor("#00E676"))
+            }
+        }
+
+        bubbleParams = WindowManager.LayoutParams(
+            bubbleSize,
+            bubbleSize,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 40
+            y = 90
+        }
+
+        // 3. Titik Tap Lempar Kail (Floating Target)
         val markerSize = (36 * density).toInt()
         tapTargetView = TextView(this).apply {
             text = "TAP"
@@ -182,19 +244,28 @@ class FloatingFishService : Service() {
             y = 350
         }
 
-        makeDraggable(controlView, controlParams)
-        makeDraggable(tapTargetView, tapTargetParams)
+        makeDraggable(controlView, controlParams, null)
+        makeDraggable(minimizedBubbleView, bubbleParams) {
+            setMinimizedState(false)
+        }
+        makeDraggable(tapTargetView, tapTargetParams, null)
 
         windowManager.addView(controlView, controlParams)
+        windowManager.addView(minimizedBubbleView, bubbleParams)
         windowManager.addView(tapTargetView, tapTargetParams)
     }
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun makeDraggable(view: View, params: WindowManager.LayoutParams) {
+    private fun makeDraggable(
+        view: View,
+        params: WindowManager.LayoutParams,
+        onClickAction: (() -> Unit)?
+    ) {
         var initX = 0
         var initY = 0
         var touchX = 0f
         var touchY = 0f
+        var moved = false
 
         view.setOnTouchListener { _, event ->
             when (event.action) {
@@ -203,23 +274,93 @@ class FloatingFishService : Service() {
                     initY = params.y
                     touchX = event.rawX
                     touchY = event.rawY
+                    moved = false
                     false
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    params.x = initX + (event.rawX - touchX).toInt()
-                    params.y = initY + (event.rawY - touchY).toInt()
+                    val dx = event.rawX - touchX
+                    val dy = event.rawY - touchY
+                    if (abs(dx) > 10f || abs(dy) > 10f) {
+                        moved = true
+                    }
+                    params.x = initX + dx.toInt()
+                    params.y = initY + dy.toInt()
                     windowManager.updateViewLayout(view, params)
                     true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved && onClickAction != null) {
+                        onClickAction.invoke()
+                        true
+                    } else {
+                        false
+                    }
                 }
                 else -> false
             }
         }
     }
 
+    private fun setMinimizedState(minimize: Boolean) {
+        isMinimized = minimize
+        if (minimize) {
+            bubbleParams.x = controlParams.x
+            bubbleParams.y = controlParams.y
+            windowManager.updateViewLayout(minimizedBubbleView, bubbleParams)
+            controlView.visibility = View.GONE
+            minimizedBubbleView.visibility = View.VISIBLE
+            updateBubbleAppearance()
+        } else {
+            controlParams.x = bubbleParams.x
+            controlParams.y = bubbleParams.y
+            windowManager.updateViewLayout(controlView, controlParams)
+            minimizedBubbleView.visibility = View.GONE
+            controlView.visibility = View.VISIBLE
+        }
+    }
+
+    private fun updateBubbleAppearance() {
+        val strokeColor = when {
+            isAutoFishing -> Color.parseColor("#00E676")
+            isFloatingEnabled -> Color.parseColor("#00B0FF")
+            else -> Color.parseColor("#90A4AE")
+        }
+        minimizedBubbleView.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor("#E612161F"))
+            setStroke(3, strokeColor)
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun toggleFloatingOverlay() {
+        isFloatingEnabled = !isFloatingEnabled
+        if (isFloatingEnabled) {
+            btnToggleFloating.text = "FLOATING: ON"
+            btnToggleFloating.setBackgroundColor(Color.parseColor("#1565C0"))
+            tapTargetView.visibility = View.VISIBLE
+        } else {
+            // Matikan auto-fish saat floating dinonaktifkan agar tap tidak menyasar sembarangan
+            if (isAutoFishing) {
+                stopAutoFishing()
+            }
+            btnToggleFloating.text = "FLOATING: OFF"
+            btnToggleFloating.setBackgroundColor(Color.parseColor("#455A64"))
+            tapTargetView.visibility = View.GONE
+        }
+        updateBubbleAppearance()
+    }
+
     @SuppressLint("SetTextI18n")
     private fun toggleFishing() {
-        isAutoFishing = !isAutoFishing
-        if (isAutoFishing) {
+        if (!isAutoFishing) {
+            if (!isFloatingEnabled) {
+                isFloatingEnabled = true
+                btnToggleFloating.text = "FLOATING: ON"
+                btnToggleFloating.setBackgroundColor(Color.parseColor("#1565C0"))
+                tapTargetView.visibility = View.VISIBLE
+            }
+            isAutoFishing = true
             btnStartStop.text = "STOP AUTO-FISH"
             btnStartStop.setBackgroundColor(Color.parseColor("#C62828"))
             lastActionTime = 0L
@@ -231,14 +372,22 @@ class FloatingFishService : Service() {
             tapTargetView.alpha = 0.45f
             windowManager.updateViewLayout(tapTargetView, tapTargetParams)
         } else {
-            btnStartStop.text = "START AUTO-FISH"
-            btnStartStop.setBackgroundColor(Color.parseColor("#2E7D32"))
-
-            // Kembalikan agar lingkaran TAP bisa digeser lagi
-            tapTargetParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            tapTargetView.alpha = 1.0f
-            windowManager.updateViewLayout(tapTargetView, tapTargetParams)
+            stopAutoFishing()
         }
+        updateBubbleAppearance()
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun stopAutoFishing() {
+        isAutoFishing = false
+        btnStartStop.text = "START AUTO-FISH"
+        btnStartStop.setBackgroundColor(Color.parseColor("#2E7D32"))
+
+        // Kembalikan agar lingkaran TAP bisa digeser lagi
+        tapTargetParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        tapTargetView.alpha = 1.0f
+        windowManager.updateViewLayout(tapTargetView, tapTargetParams)
+        updateBubbleAppearance()
     }
 
     private fun startMemoryReader() {
@@ -276,7 +425,7 @@ class FloatingFishService : Service() {
             }
         }
 
-        if (!isAutoFishing || t.pid <= 0) return
+        if (!isAutoFishing || !isFloatingEnabled || t.pid <= 0) return
 
         val loc = IntArray(2)
         tapTargetView.getLocationOnScreen(loc)
@@ -298,8 +447,7 @@ class FloatingFishService : Service() {
         }
         waitingForCastSettle = false
 
-        // 2. Deteksi ikan menyambar:
-        // Di Terraria, saat ikan menggigit: ai[0] berubah ke 1.0f atau ai[1] turun ke nilai negatif (< -0.5f)
+        // 2. Deteksi ikan menyambar: ai[0] == 1.0f atau ai[1] < -0.5f
         val isBiting = (t.ai0State == 1.0f || t.ai1BiteTimer < -0.5f)
         if (isBiting && now - lastActionTime > 900L) {
             if (crateOnlyMode) {
@@ -320,6 +468,7 @@ class FloatingFishService : Service() {
         isAutoFishing = false
         RootDaemonBridge.stopDaemon()
         if (::controlView.isInitialized) windowManager.removeView(controlView)
+        if (::minimizedBubbleView.isInitialized) windowManager.removeView(minimizedBubbleView)
         if (::tapTargetView.isInitialized) windowManager.removeView(tapTargetView)
         super.onDestroy()
     }
