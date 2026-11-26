@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cinttypes>
+#include <cmath>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -12,17 +13,16 @@
 #include <cctype>
 #include <vector>
 #include <string>
-#include <sstream>
 #include <algorithm>
 
 struct Offsets {
-    uint64_t mainTypeInfo = 0x0;       // RVA of Terraria.Main_TypeInfo in libil2cpp.so (0 = auto heap scan)
-    uint64_t staticFields = 0xB8;      // Il2CppClass::static_fields
-    uint64_t projectileField = 0x168;  // Main.projectile static field offset
-    uint64_t projActive = 0x20;        // Entity.active (bool)
-    uint64_t projAiStyle = 0x94;       // Projectile.aiStyle (int32, 61 = Fishing Bobber)
-    uint64_t projAiArray = 0xB8;       // Projectile.ai (float[])
-    uint64_t projLocalAiArray = 0xC0;  // Projectile.localAI (float[])
+    uint64_t mainTypeInfo = 0x0;       // 0x0 = Auto Heap Scan
+    uint64_t staticFields = 0xB8;
+    uint64_t projectileField = 0x168;
+    uint64_t projActive = 0x14;        // Entity.active (ARM64)
+    uint64_t projAiStyle = 0x0;        // Auto-detected saat runtime
+    uint64_t projAiArray = 0x0;        // Auto-detected saat runtime
+    uint64_t projLocalAiArray = 0x0;   // Auto-detected saat runtime
 };
 
 struct MemoryRegion {
@@ -32,9 +32,21 @@ struct MemoryRegion {
 
 static Offsets gOffsets;
 static uint64_t gCachedBobberAddr = 0;
+static bool gLayoutDetected = false;
+
+inline uint64_t stripTag(uint64_t ptr) {
+    return ptr & 0x00FFFFFFFFFFFFFFULL;
+}
+
+inline bool isValidUserPtr(uint64_t ptr) {
+    uint64_t clean = stripTag(ptr);
+    return clean >= 0x10000000ULL && clean <= 0x0000FFFFFFFFFFFFULL && (clean & 0x3) == 0;
+}
 
 bool readMemory(pid_t pid, uint64_t address, void* buffer, size_t size) {
-    if (address < 0x10000 || size == 0) return false;
+    address = stripTag(address);
+    if (address < 0x10000ULL || address > 0x0000FFFFFFFFFFFFULL || size == 0) return false;
+
     struct iovec local[1];
     struct iovec remote[1];
     local[0].iov_base = buffer;
@@ -124,8 +136,41 @@ std::vector<MemoryRegion> getWritableHeapRegions(pid_t pid) {
     return regions;
 }
 
-bool validateAndReadBobber(pid_t pid, uint64_t projPtr, float& outAi0, float& outAi1, int& outItemId) {
-    if (projPtr < 0x10000000ULL || (projPtr & 0x7) != 0) return false;
+bool readFloatArrayPair(pid_t pid, uint64_t aiArrPtr, uint64_t localAiArrPtr,
+                        float& outAi0, float& outAi1, int& outItemId) {
+    if (!isValidUserPtr(aiArrPtr) || !isValidUserPtr(localAiArrPtr)) return false;
+
+    uint8_t aiBuf[0x30] = {0};
+    uint8_t localBuf[0x30] = {0};
+    if (!readMemory(pid, aiArrPtr, aiBuf, sizeof(aiBuf))) return false;
+    if (!readMemory(pid, localAiArrPtr, localBuf, sizeof(localBuf))) return false;
+
+    uint64_t aiKlass = *reinterpret_cast<uint64_t*>(&aiBuf[0x00]);
+    uint64_t localKlass = *reinterpret_cast<uint64_t*>(&localBuf[0x00]);
+    if (!isValidUserPtr(aiKlass) || !isValidUserPtr(localKlass)) return false;
+
+    uint64_t aiLen = *reinterpret_cast<uint64_t*>(&aiBuf[0x18]);
+    uint64_t localAiLen = *reinterpret_cast<uint64_t*>(&localBuf[0x18]);
+    // Terraria Projectile.maxAI adalah 2 atau 3
+    if (aiLen < 2 || aiLen > 4 || localAiLen != aiLen) return false;
+
+    float ai0 = *reinterpret_cast<float*>(&aiBuf[0x20]);
+    float ai1 = *reinterpret_cast<float*>(&aiBuf[0x24]);
+    float localAi1 = *reinterpret_cast<float*>(&localBuf[0x24]);
+
+    if (std::isnan(ai0) || std::isnan(ai1) || std::isnan(localAi1)) return false;
+    if (ai0 < -1.0f || ai0 > 5.0f) return false;
+    if (ai1 < -1000.0f || ai1 > 1000.0f) return false;
+    if (localAi1 < 0.0f || localAi1 > 10000.0f) return false;
+
+    outAi0 = ai0;
+    outAi1 = ai1;
+    outItemId = static_cast<int>(localAi1);
+    return true;
+}
+
+bool validateWithKnownLayout(pid_t pid, uint64_t projPtr, float& outAi0, float& outAi1, int& outItemId) {
+    if (!gLayoutDetected || !isValidUserPtr(projPtr)) return false;
 
     uint8_t active = 0;
     int32_t aiStyle = 0;
@@ -137,65 +182,47 @@ bool validateAndReadBobber(pid_t pid, uint64_t projPtr, float& outAi0, float& ou
     if (!readVal(pid, projPtr + gOffsets.projAiArray, aiArrPtr)) return false;
     if (!readVal(pid, projPtr + gOffsets.projLocalAiArray, localAiArrPtr)) return false;
 
-    if (aiArrPtr < 0x10000000ULL || localAiArrPtr < 0x10000000ULL) return false;
-
-    // IL2CPP Array layout on ARM64:
-    // +0x18: max_length (uint64_t)
-    // +0x20: elements[0]
-    uint64_t aiLen = 0, localAiLen = 0;
-    if (!readVal(pid, aiArrPtr + 0x18, aiLen) || aiLen < 2 || aiLen > 16) return false;
-    if (!readVal(pid, localAiArrPtr + 0x18, localAiLen) || localAiLen < 2 || localAiLen > 16) return false;
-
-    float ai[2] = {0.0f, 0.0f};
-    float localAi[2] = {0.0f, 0.0f};
-    if (!readMemory(pid, aiArrPtr + 0x20, ai, sizeof(ai))) return false;
-    if (!readMemory(pid, localAiArrPtr + 0x20, localAi, sizeof(localAi))) return false;
-
-    // Sanity check bobber state values:
-    // ai[0] is state (0.0 = floating, 1.0 = reeling, 2.0 = broken)
-    if (ai[0] < -1.0f || ai[0] > 5.0f) return false;
-    // ai[1] is bite timer (0 when idle, negative when biting, positive while reeling)
-    if (ai[1] < -1000.0f || ai[1] > 1000.0f) return false;
-
-    outAi0 = ai[0];
-    outAi1 = ai[1];
-    outItemId = static_cast<int>(localAi[1]);
-    return true;
+    return readFloatArrayPair(pid, aiArrPtr, localAiArrPtr, outAi0, outAi1, outItemId);
 }
 
-// Mode 1: Direct O(1) IL2CPP pointer chain lookup via Main.projectile[]
-bool findBobberViaPointerChain(pid_t pid, uint64_t il2cppBase, float& ai0, float& ai1, int& itemId) {
-    if (gOffsets.mainTypeInfo == 0 || il2cppBase == 0) return false;
+// Otomatis mendeteksi struktur Projectile dari alamat kandidat aiStyle == 61
+bool tryAutoDiscoverFromStyleAddr(pid_t pid, uint64_t styleAddr, float& outAi0, float& outAi1, int& outItemId) {
+    // Cek mundur kandidat base objek Projectile (offset aiStyle biasanya di 0x60..0x180)
+    for (uint64_t styleOff = 0x60; styleOff <= 0x180; styleOff += 4) {
+        uint64_t projPtr = styleAddr - styleOff;
+        if ((projPtr & 0x7) != 0) continue;
 
-    uint64_t mainClassPtr = 0;
-    if (!readVal(pid, il2cppBase + gOffsets.mainTypeInfo, mainClassPtr) || mainClassPtr == 0) return false;
+        uint8_t obj[0x1A0] = {0};
+        if (!readMemory(pid, projPtr, obj, sizeof(obj))) continue;
 
-    uint64_t staticFieldsPtr = 0;
-    if (!readVal(pid, mainClassPtr + gOffsets.staticFields, staticFieldsPtr) || staticFieldsPtr == 0) return false;
+        uint64_t klass = *reinterpret_cast<uint64_t*>(&obj[0x00]);
+        uint64_t monitor = *reinterpret_cast<uint64_t*>(&obj[0x08]);
+        int32_t whoAmI = *reinterpret_cast<int32_t*>(&obj[0x10]);
+        uint8_t active = obj[0x14];
 
-    uint64_t projArrayPtr = 0;
-    if (!readVal(pid, staticFieldsPtr + gOffsets.projectileField, projArrayPtr) || projArrayPtr == 0) return false;
+        if (!isValidUserPtr(klass) || monitor != 0) continue;
+        if (whoAmI < 0 || whoAmI > 1000 || active != 1) continue;
 
-    uint64_t arrayLen = 0;
-    if (!readVal(pid, projArrayPtr + 0x18, arrayLen) || arrayLen == 0 || arrayLen > 2000) return false;
-
-    size_t scanCount = std::min<size_t>(static_cast<size_t>(arrayLen), 1001);
-    std::vector<uint64_t> elements(scanCount);
-    if (!readMemory(pid, projArrayPtr + 0x20, elements.data(), scanCount * sizeof(uint64_t))) return false;
-
-    for (size_t i = 0; i < scanCount; ++i) {
-        if (validateAndReadBobber(pid, elements[i], ai0, ai1, itemId)) {
-            gCachedBobberAddr = elements[i];
-            return true;
+        // Cari pasangan pointer bersebelahan: ai[] dan localAI[]
+        for (uint64_t ptrOff = 0x50; ptrOff <= 0x160; ptrOff += 8) {
+            uint64_t p1 = *reinterpret_cast<uint64_t*>(&obj[ptrOff]);
+            uint64_t p2 = *reinterpret_cast<uint64_t*>(&obj[ptrOff + 8]);
+            if (readFloatArrayPair(pid, p1, p2, outAi0, outAi1, outItemId)) {
+                gOffsets.projAiStyle = styleOff;
+                gOffsets.projAiArray = ptrOff;
+                gOffsets.projLocalAiArray = ptrOff + 8;
+                gLayoutDetected = true;
+                gCachedBobberAddr = projPtr;
+                return true;
+            }
         }
     }
     return false;
 }
 
-// Mode 2: Heuristic Heap Scanner for Projectile with aiStyle == 61
 bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
     if (gCachedBobberAddr != 0) {
-        if (validateAndReadBobber(pid, gCachedBobberAddr, ai0, ai1, itemId)) {
+        if (validateWithKnownLayout(pid, gCachedBobberAddr, ai0, ai1, itemId)) {
             return true;
         }
         gCachedBobberAddr = 0;
@@ -210,13 +237,20 @@ bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
             size_t toRead = std::min<size_t>(chunkSize, static_cast<size_t>(reg.end - addr));
             if (!readMemory(pid, addr, buf.data(), toRead)) continue;
 
-            for (size_t off = static_cast<size_t>(gOffsets.projAiStyle); off + 0x40 < toRead; off += 8) {
-                int32_t candidateStyle = *reinterpret_cast<int32_t*>(&buf[off]);
-                if (candidateStyle == 61) {
-                    uint64_t candidateProj = addr + off - gOffsets.projAiStyle;
-                    if (validateAndReadBobber(pid, candidateProj, ai0, ai1, itemId)) {
-                        gCachedBobberAddr = candidateProj;
-                        return true;
+            for (size_t off = 0; off + 4 <= toRead; off += 4) {
+                int32_t val = *reinterpret_cast<int32_t*>(&buf[off]);
+                if (val == 61) {
+                    uint64_t styleAddr = addr + off;
+                    if (gLayoutDetected) {
+                        uint64_t candidateProj = styleAddr - gOffsets.projAiStyle;
+                        if (validateWithKnownLayout(pid, candidateProj, ai0, ai1, itemId)) {
+                            gCachedBobberAddr = candidateProj;
+                            return true;
+                        }
+                    } else {
+                        if (tryAutoDiscoverFromStyleAddr(pid, styleAddr, ai0, ai1, itemId)) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -257,11 +291,6 @@ int main(int argc, char** argv) {
 
     const char* pkgName = "com.and.games505.TerrariaPaid";
     if (argc >= 2) pkgName = argv[1];
-    if (argc >= 3) gOffsets.mainTypeInfo = strtoull(argv[2], nullptr, 16);
-    if (argc >= 4) gOffsets.projectileField = strtoull(argv[3], nullptr, 16);
-    if (argc >= 5) gOffsets.projAiStyle = strtoull(argv[4], nullptr, 16);
-    if (argc >= 6) gOffsets.projAiArray = strtoull(argv[5], nullptr, 16);
-    if (argc >= 7) gOffsets.projLocalAiArray = strtoull(argv[6], nullptr, 16);
 
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -281,15 +310,11 @@ int main(int argc, char** argv) {
         int itemId = 0;
         bool found = false;
 
-        if (gOffsets.mainTypeInfo != 0 && il2cppBase != 0) {
-            found = findBobberViaPointerChain(pid, il2cppBase, ai0, ai1, itemId);
+        if (gCachedBobberAddr != 0 || scanCooldown <= 0) {
+            found = findBobberViaHeapScan(pid, ai0, ai1, itemId);
+            scanCooldown = found ? 0 : 15;
         } else {
-            if (gCachedBobberAddr != 0 || scanCooldown <= 0) {
-                found = findBobberViaHeapScan(pid, ai0, ai1, itemId);
-                scanCooldown = found ? 0 : 20;
-            } else {
-                scanCooldown--;
-            }
+            scanCooldown--;
         }
 
         printf("STATUS|%d|%" PRIx64 "|%d|%.2f|%.2f|%d\n",
