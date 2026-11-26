@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cinttypes>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -38,7 +39,7 @@ bool readMemory(pid_t pid, uint64_t address, void* buffer, size_t size) {
     struct iovec remote[1];
     local[0].iov_base = buffer;
     local[0].iov_len = size;
-    remote[0].iov_base = reinterpret_cast<void*>(address);
+    remote[0].iov_base = reinterpret_cast<void*>(static_cast<uintptr_t>(address));
     remote[0].iov_len = size;
 
     ssize_t nread = process_vm_readv(pid, local, 1, remote, 1, 0);
@@ -56,7 +57,7 @@ pid_t findPackagePid(const char* packageName) {
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
-        if (!isdigit(entry->d_name[0])) continue;
+        if (!isdigit(static_cast<unsigned char>(entry->d_name[0]))) continue;
         pid_t pid = atoi(entry->d_name);
         char cmdPath[64];
         snprintf(cmdPath, sizeof(cmdPath), "/proc/%d/cmdline", pid);
@@ -64,9 +65,9 @@ pid_t findPackagePid(const char* packageName) {
         FILE* fp = fopen(cmdPath, "r");
         if (fp) {
             char cmdline[256] = {0};
-            fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+            size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
             fclose(fp);
-            if (strcmp(cmdline, packageName) == 0) {
+            if (len > 0 && strcmp(cmdline, packageName) == 0) {
                 closedir(dir);
                 return pid;
             }
@@ -87,7 +88,7 @@ uint64_t getModuleBase(pid_t pid, const char* moduleName) {
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, moduleName)) {
             uint64_t start = 0;
-            if (sscanf(line, "%lx-", &start) == 1) {
+            if (sscanf(line, "%" SCNx64 "-", &start) == 1) {
                 baseAddr = start;
                 break;
             }
@@ -108,12 +109,11 @@ std::vector<MemoryRegion> getWritableHeapRegions(pid_t pid) {
     while (fgets(line, sizeof(line), fp)) {
         uint64_t start = 0, end = 0;
         char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3) {
+        if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s", &start, &end, perms) == 3) {
             if (perms[0] == 'r' && perms[1] == 'w' && perms[3] == 'p') {
-                // Focus on anonymous / scudo / unity heap segments
                 if (strstr(line, "[anon:") != nullptr || strchr(line, '/') == nullptr) {
-                    size_t len = end - start;
-                    if (len >= 0x1000 && len <= 64 * 1024 * 1024) {
+                    uint64_t len = end - start;
+                    if (len >= 0x1000 && len <= 64ULL * 1024ULL * 1024ULL) {
                         regions.push_back({start, end});
                     }
                 }
@@ -179,7 +179,7 @@ bool findBobberViaPointerChain(pid_t pid, uint64_t il2cppBase, float& ai0, float
     uint64_t arrayLen = 0;
     if (!readVal(pid, projArrayPtr + 0x18, arrayLen) || arrayLen == 0 || arrayLen > 2000) return false;
 
-    size_t scanCount = std::min<size_t>(arrayLen, 1001);
+    size_t scanCount = std::min<size_t>(static_cast<size_t>(arrayLen), 1001);
     std::vector<uint64_t> elements(scanCount);
     if (!readMemory(pid, projArrayPtr + 0x20, elements.data(), scanCount * sizeof(uint64_t))) return false;
 
@@ -194,7 +194,6 @@ bool findBobberViaPointerChain(pid_t pid, uint64_t il2cppBase, float& ai0, float
 
 // Mode 2: Heuristic Heap Scanner for Projectile with aiStyle == 61
 bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
-    // Fast path: check cached bobber address first
     if (gCachedBobberAddr != 0) {
         if (validateAndReadBobber(pid, gCachedBobberAddr, ai0, ai1, itemId)) {
             return true;
@@ -208,11 +207,10 @@ bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
 
     for (const auto& reg : regions) {
         for (uint64_t addr = reg.start; addr < reg.end; addr += chunkSize) {
-            size_t toRead = std::min<size_t>(chunkSize, reg.end - addr);
+            size_t toRead = std::min<size_t>(chunkSize, static_cast<size_t>(reg.end - addr));
             if (!readMemory(pid, addr, buf.data(), toRead)) continue;
 
-            // Scan aligned 4-byte integers for aiStyle == 61 (0x3D)
-            for (size_t off = gOffsets.projAiStyle; off + 0x40 < toRead; off += 8) {
+            for (size_t off = static_cast<size_t>(gOffsets.projAiStyle); off + 0x40 < toRead; off += 8) {
                 int32_t candidateStyle = *reinterpret_cast<int32_t*>(&buf[off]);
                 if (candidateStyle == 61) {
                     uint64_t candidateProj = addr + off - gOffsets.projAiStyle;
@@ -242,7 +240,8 @@ void processStdinCommands() {
             if (sscanf(cmd, "TAP %d %d", &x, &y) == 2) {
                 char shellCmd[96];
                 snprintf(shellCmd, sizeof(shellCmd), "input tap %d %d", x, y);
-                system(shellCmd);
+                int rc = system(shellCmd);
+                (void)rc;
             } else if (strncmp(cmd, "QUIT", 4) == 0) {
                 exit(0);
             }
@@ -287,13 +286,13 @@ int main(int argc, char** argv) {
         } else {
             if (gCachedBobberAddr != 0 || scanCooldown <= 0) {
                 found = findBobberViaHeapScan(pid, ai0, ai1, itemId);
-                scanCooldown = found ? 0 : 20; // Throttle full heap scan to ~2x/sec when idle
+                scanCooldown = found ? 0 : 20;
             } else {
                 scanCooldown--;
             }
         }
 
-        printf("STATUS|%d|%lx|%d|%.2f|%.2f|%d\n",
+        printf("STATUS|%d|%" PRIx64 "|%d|%.2f|%.2f|%d\n",
                pid, il2cppBase, found ? 1 : 0, ai0, ai1, itemId);
 
         usleep(25000); // 40 Hz polling

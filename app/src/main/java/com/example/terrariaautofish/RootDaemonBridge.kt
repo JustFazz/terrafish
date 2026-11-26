@@ -100,8 +100,7 @@ object RootDaemonBridge {
     fun sendTap(x: Int, y: Int) {
         try {
             stdinStream?.apply {
-                writeBytes("TAP $x $y
-")
+                writeBytes("TAP $x $y\n")
                 flush()
             }
         } catch (_: Exception) {
@@ -111,8 +110,7 @@ object RootDaemonBridge {
     fun stopDaemon() {
         isConnected = false
         try {
-            stdinStream?.writeBytes("QUIT
-")
+            stdinStream?.writeBytes("QUIT\n")
             stdinStream?.flush()
             stdinStream?.close()
         } catch (_: Exception) {

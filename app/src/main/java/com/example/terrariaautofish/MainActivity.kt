@@ -35,15 +35,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         val header = TextView(this).apply {
-            text = "Terraria Auto-Fish (Root Memory Reader)
-
-" +
-                   "Membaca langsung memori Terraria.Projectile (aiStyle = 61) di RAM via Root Daemon.
-" +
-                   "• Tidak butuh izin rekam layar (MediaProjection)
-" +
-                   "• Mendukung filter Crate otomatis dari RAM (localAI[1])
-" +
+            text = "Terraria Auto-Fish (Root Memory Reader)\n\n" +
+                   "Membaca langsung memori Terraria.Projectile (aiStyle = 61) di RAM via Root Daemon.\n" +
+                   "• Tidak butuh izin rekam layar (MediaProjection)\n" +
+                   "• Mendukung filter Crate otomatis dari RAM (localAI[1])\n" +
                    "• Isi Main_TypeInfo RVA dengan 0x0 untuk Auto Heap Scan"
             textSize = 14f
         }

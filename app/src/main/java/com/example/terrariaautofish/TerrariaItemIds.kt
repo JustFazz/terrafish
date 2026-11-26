@@ -32,7 +32,7 @@ object TerrariaItemIds {
 
     private val RARE_CATCHES = mapOf(
         2308 to "Golden Carp",
-        2311 to "Specious/Prismite",
+        2311 to "Prismite",
         2313 to "Obsidifish",
         2314 to "Flarefin Koi",
         2420 to "Zephyr Fish",
