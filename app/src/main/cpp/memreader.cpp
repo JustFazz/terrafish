@@ -16,11 +16,8 @@
 #include <algorithm>
 
 struct Offsets {
-    uint64_t mainTypeInfo = 0x0;       // 0x0 = Auto Heap Scan
-    uint64_t staticFields = 0xB8;
-    uint64_t projectileField = 0x168;
     uint64_t projActive = 0x14;        // Entity.active (ARM64)
-    uint64_t projAiStyle = 0x0;        // Auto-detected saat runtime
+    uint64_t projAiStyle = 0x0;        // Auto-detected saat runtime (0x60..0x280)
     uint64_t projAiArray = 0x0;        // Auto-detected saat runtime
     uint64_t projLocalAiArray = 0x0;   // Auto-detected saat runtime
 };
@@ -33,6 +30,8 @@ struct MemoryRegion {
 static Offsets gOffsets;
 static uint64_t gCachedBobberAddr = 0;
 static bool gLayoutDetected = false;
+static int gLastRegionCount = 0;
+static int gLastStyleHits = 0;
 
 inline uint64_t stripTag(uint64_t ptr) {
     return ptr & 0x00FFFFFFFFFFFFFFULL;
@@ -123,9 +122,11 @@ std::vector<MemoryRegion> getWritableHeapRegions(pid_t pid) {
         char perms[8] = {0};
         if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s", &start, &end, perms) == 3) {
             if (perms[0] == 'r' && perms[1] == 'w' && perms[3] == 'p') {
-                if (strstr(line, "[anon:") != nullptr || strchr(line, '/') == nullptr) {
+                if (strstr(line, "[anon:") != nullptr ||
+                    strstr(line, "[heap]") != nullptr ||
+                    strchr(line, '/') == nullptr) {
                     uint64_t len = end - start;
-                    if (len >= 0x1000 && len <= 64ULL * 1024ULL * 1024ULL) {
+                    if (len >= 0x1000 && len <= 512ULL * 1024ULL * 1024ULL) {
                         regions.push_back({start, end});
                     }
                 }
@@ -139,6 +140,7 @@ std::vector<MemoryRegion> getWritableHeapRegions(pid_t pid) {
 bool readFloatArrayPair(pid_t pid, uint64_t aiArrPtr, uint64_t localAiArrPtr,
                         float& outAi0, float& outAi1, int& outItemId) {
     if (!isValidUserPtr(aiArrPtr) || !isValidUserPtr(localAiArrPtr)) return false;
+    if (stripTag(aiArrPtr) == stripTag(localAiArrPtr)) return false;
 
     uint8_t aiBuf[0x30] = {0};
     uint8_t localBuf[0x30] = {0};
@@ -146,12 +148,16 @@ bool readFloatArrayPair(pid_t pid, uint64_t aiArrPtr, uint64_t localAiArrPtr,
     if (!readMemory(pid, localAiArrPtr, localBuf, sizeof(localBuf))) return false;
 
     uint64_t aiKlass = *reinterpret_cast<uint64_t*>(&aiBuf[0x00]);
+    uint64_t aiMonitor = *reinterpret_cast<uint64_t*>(&aiBuf[0x08]);
     uint64_t localKlass = *reinterpret_cast<uint64_t*>(&localBuf[0x00]);
-    if (!isValidUserPtr(aiKlass) || !isValidUserPtr(localKlass)) return false;
+    uint64_t localMonitor = *reinterpret_cast<uint64_t*>(&localBuf[0x08]);
+
+    // ai[] dan localAI[] sama-sama bertipe float[] (System.Single[]) sehingga klass pointer identik
+    if (!isValidUserPtr(aiKlass) || stripTag(aiKlass) != stripTag(localKlass)) return false;
+    if (aiMonitor != 0 || localMonitor != 0) return false;
 
     uint64_t aiLen = *reinterpret_cast<uint64_t*>(&aiBuf[0x18]);
     uint64_t localAiLen = *reinterpret_cast<uint64_t*>(&localBuf[0x18]);
-    // Terraria Projectile.maxAI adalah 2 atau 3
     if (aiLen < 2 || aiLen > 4 || localAiLen != aiLen) return false;
 
     float ai0 = *reinterpret_cast<float*>(&aiBuf[0x20]);
@@ -185,14 +191,13 @@ bool validateWithKnownLayout(pid_t pid, uint64_t projPtr, float& outAi0, float& 
     return readFloatArrayPair(pid, aiArrPtr, localAiArrPtr, outAi0, outAi1, outItemId);
 }
 
-// Otomatis mendeteksi struktur Projectile dari alamat kandidat aiStyle == 61
 bool tryAutoDiscoverFromStyleAddr(pid_t pid, uint64_t styleAddr, float& outAi0, float& outAi1, int& outItemId) {
-    // Cek mundur kandidat base objek Projectile (offset aiStyle biasanya di 0x60..0x180)
-    for (uint64_t styleOff = 0x60; styleOff <= 0x180; styleOff += 4) {
+    // Jangkauan offset aiStyle pada Terraria 1.4.4 64-bit: 0x60..0x280
+    for (uint64_t styleOff = 0x60; styleOff <= 0x280; styleOff += 4) {
         uint64_t projPtr = styleAddr - styleOff;
         if ((projPtr & 0x7) != 0) continue;
 
-        uint8_t obj[0x1A0] = {0};
+        uint8_t obj[0x2A0] = {0};
         if (!readMemory(pid, projPtr, obj, sizeof(obj))) continue;
 
         uint64_t klass = *reinterpret_cast<uint64_t*>(&obj[0x00]);
@@ -203,8 +208,7 @@ bool tryAutoDiscoverFromStyleAddr(pid_t pid, uint64_t styleAddr, float& outAi0, 
         if (!isValidUserPtr(klass) || monitor != 0) continue;
         if (whoAmI < 0 || whoAmI > 1000 || active != 1) continue;
 
-        // Cari pasangan pointer bersebelahan: ai[] dan localAI[]
-        for (uint64_t ptrOff = 0x50; ptrOff <= 0x160; ptrOff += 8) {
+        for (uint64_t ptrOff = 0x40; ptrOff <= 0x180; ptrOff += 8) {
             uint64_t p1 = *reinterpret_cast<uint64_t*>(&obj[ptrOff]);
             uint64_t p2 = *reinterpret_cast<uint64_t*>(&obj[ptrOff + 8]);
             if (readFloatArrayPair(pid, p1, p2, outAi0, outAi1, outItemId)) {
@@ -229,7 +233,10 @@ bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
     }
 
     auto regions = getWritableHeapRegions(pid);
-    const size_t chunkSize = 256 * 1024;
+    gLastRegionCount = static_cast<int>(regions.size());
+    int hits = 0;
+
+    const size_t chunkSize = 1024 * 1024; // 1 MB per read
     std::vector<uint8_t> buf(chunkSize);
 
     for (const auto& reg : regions) {
@@ -240,15 +247,18 @@ bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
             for (size_t off = 0; off + 4 <= toRead; off += 4) {
                 int32_t val = *reinterpret_cast<int32_t*>(&buf[off]);
                 if (val == 61) {
+                    hits++;
                     uint64_t styleAddr = addr + off;
                     if (gLayoutDetected) {
                         uint64_t candidateProj = styleAddr - gOffsets.projAiStyle;
                         if (validateWithKnownLayout(pid, candidateProj, ai0, ai1, itemId)) {
                             gCachedBobberAddr = candidateProj;
+                            gLastStyleHits = hits;
                             return true;
                         }
                     } else {
                         if (tryAutoDiscoverFromStyleAddr(pid, styleAddr, ai0, ai1, itemId)) {
+                            gLastStyleHits = hits;
                             return true;
                         }
                     }
@@ -256,6 +266,7 @@ bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
             }
         }
     }
+    gLastStyleHits = hits;
     return false;
 }
 
@@ -294,7 +305,7 @@ int main(int argc, char** argv) {
 
     setvbuf(stdout, nullptr, _IONBF, 0);
 
-    int scanCooldown = 0;
+    int scanCooldown = 0; 
     while (true) {
         processStdinCommands();
 
@@ -312,15 +323,20 @@ int main(int argc, char** argv) {
 
         if (gCachedBobberAddr != 0 || scanCooldown <= 0) {
             found = findBobberViaHeapScan(pid, ai0, ai1, itemId);
-            scanCooldown = found ? 0 : 15;
+            scanCooldown = found ? 0 : 12;
         } else {
             scanCooldown--;
         }
 
-        printf("STATUS|%d|%" PRIx64 "|%d|%.2f|%.2f|%d\n",
-               pid, il2cppBase, found ? 1 : 0, ai0, ai1, itemId);
+        if (found) {
+            printf("STATUS|%d|%" PRIx64 " (off:%" PRIx64 "/%" PRIx64 ")|1|%.2f|%.2f|%d\n",
+                   pid, il2cppBase, gOffsets.projAiStyle, gOffsets.projAiArray, ai0, ai1, itemId);
+        } else {
+            printf("STATUS|%d|%" PRIx64 " (R:%d H:%d)|0|0.0|0.0|0\n",
+                   pid, il2cppBase, gLastRegionCount, gLastStyleHits);
+        }
 
-        usleep(25000); // 40 Hz polling
+        usleep(25000);
     }
 
     return 0;
