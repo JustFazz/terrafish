@@ -2,8 +2,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
-#include <cinttypes>
-#include <cmath>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -13,12 +11,18 @@
 #include <cctype>
 #include <vector>
 #include <string>
+#include <sstream>
 #include <algorithm>
 
 struct Offsets {
-    uint64_t projAiStyle = 0x0;
-    uint64_t projAiArray = 0x0;
-    uint64_t projLocalAiArray = 0x0;
+    uint64_t mainTypeInfo = 0x0;       // RVA of Terraria.Main_TypeInfo in libil2cpp.so (0 = auto heap scan)
+    uint64_t staticFields = 0xB8;      // Il2CppClass::static_fields
+    uint64_t projectileField = 0x5B8;  // Main.projectile static field offset
+    uint64_t projActive = 0x49;        // Projectile.active (bool)
+    uint64_t projBobber = 0x58;        // Projectile.bobber (bool)
+    uint64_t projAiStyle = 0x98;       // Projectile.aiStyle (int32, 61 = Fishing Bobber)
+    uint64_t projAiInline = 0x78;      // Projectile.ai inline float[3] (ai[0]=+0x78, ai[1]=+0x7C)
+    uint64_t projLocalAiInline = 0x84; // Projectile.localAI inline float[3] (localAI[1]=+0x88)
 };
 
 struct MemoryRegion {
@@ -28,34 +32,14 @@ struct MemoryRegion {
 
 static Offsets gOffsets;
 static uint64_t gCachedBobberAddr = 0;
-static bool gLayoutDetected = false;
-
-static float gLastLocalAi0 = -9999.0f;
-static float gLastAi1 = -9999.0f;
-static int gStaleTicks = 0;
-
-static int gLastRegionCount = 0;
-static int gLastStyleHits = 0;
-static int gLastProjCandidates = 0;
-
-inline uint64_t stripTag(uint64_t ptr) {
-    return ptr & 0x00FFFFFFFFFFFFFFULL;
-}
-
-inline bool isValidUserPtr(uint64_t ptr) {
-    uint64_t clean = stripTag(ptr);
-    return clean >= 0x10000000ULL && clean <= 0x0000FFFFFFFFFFFFULL && (clean & 0x7) == 0;
-}
 
 bool readMemory(pid_t pid, uint64_t address, void* buffer, size_t size) {
-    address = stripTag(address);
-    if (address < 0x10000ULL || address > 0x0000FFFFFFFFFFFFULL || size == 0) return false;
-
+    if (address < 0x10000 || size == 0) return false;
     struct iovec local[1];
     struct iovec remote[1];
     local[0].iov_base = buffer;
     local[0].iov_len = size;
-    remote[0].iov_base = reinterpret_cast<void*>(static_cast<uintptr_t>(address));
+    remote[0].iov_base = reinterpret_cast<void*>(address);
     remote[0].iov_len = size;
 
     ssize_t nread = process_vm_readv(pid, local, 1, remote, 1, 0);
@@ -67,25 +51,13 @@ bool readVal(pid_t pid, uint64_t address, T& out) {
     return readMemory(pid, address, &out, sizeof(T));
 }
 
-bool isValidIl2CppObjectHeader(pid_t pid, uint64_t objPtr) {
-    if (!isValidUserPtr(objPtr)) return false;
-    uint64_t header[2] = {0, 0};
-    if (!readMemory(pid, objPtr, header, sizeof(header))) return false;
-    if (!isValidUserPtr(header[0]) || header[1] != 0) return false;
-
-    // Verifikasi bahwa pointer klass menunjuk ke struct Il2CppClass yang valid
-    uint64_t imagePtr = 0;
-    if (!readVal(pid, header[0], imagePtr)) return false;
-    return isValidUserPtr(imagePtr);
-}
-
 pid_t findPackagePid(const char* packageName) {
     DIR* dir = opendir("/proc");
     if (!dir) return -1;
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
-        if (!isdigit(static_cast<unsigned char>(entry->d_name[0]))) continue;
+        if (!isdigit(entry->d_name[0])) continue;
         pid_t pid = atoi(entry->d_name);
         char cmdPath[64];
         snprintf(cmdPath, sizeof(cmdPath), "/proc/%d/cmdline", pid);
@@ -93,9 +65,9 @@ pid_t findPackagePid(const char* packageName) {
         FILE* fp = fopen(cmdPath, "r");
         if (fp) {
             char cmdline[256] = {0};
-            size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, fp);
+            fread(cmdline, 1, sizeof(cmdline) - 1, fp);
             fclose(fp);
-            if (len > 0 && strcmp(cmdline, packageName) == 0) {
+            if (strcmp(cmdline, packageName) == 0) {
                 closedir(dir);
                 return pid;
             }
@@ -116,7 +88,7 @@ uint64_t getModuleBase(pid_t pid, const char* moduleName) {
     while (fgets(line, sizeof(line), fp)) {
         if (strstr(line, moduleName)) {
             uint64_t start = 0;
-            if (sscanf(line, "%" SCNx64 "-", &start) == 1) {
+            if (sscanf(line, "%lx-", &start) == 1) {
                 baseAddr = start;
                 break;
             }
@@ -137,13 +109,12 @@ std::vector<MemoryRegion> getWritableHeapRegions(pid_t pid) {
     while (fgets(line, sizeof(line), fp)) {
         uint64_t start = 0, end = 0;
         char perms[8] = {0};
-        if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %7s", &start, &end, perms) == 3) {
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3) {
             if (perms[0] == 'r' && perms[1] == 'w' && perms[3] == 'p') {
-                if (strstr(line, "[anon:") != nullptr ||
-                    strstr(line, "[heap]") != nullptr ||
-                    strchr(line, '/') == nullptr) {
-                    uint64_t len = end - start;
-                    if (len >= 0x1000 && len <= 512ULL * 1024ULL * 1024ULL) {
+                // Fokus ke segmen heap anonymous / scudo / unity
+                if (strstr(line, "[anon:") != nullptr || strchr(line, '/') == nullptr) {
+                    size_t len = end - start;
+                    if (len >= 0x1000 && len <= 64 * 1024 * 1024) {
                         regions.push_back({start, end});
                     }
                 }
@@ -154,209 +125,98 @@ std::vector<MemoryRegion> getWritableHeapRegions(pid_t pid) {
     return regions;
 }
 
-bool readFloatArray(pid_t pid, uint64_t arrPtr, uint64_t& outKlass, float& e0, float& e1) {
-    if (!isValidUserPtr(arrPtr)) return false;
+bool validateAndReadBobber(pid_t pid, uint64_t projPtr, float& outAi0, float& outAi1, int& outItemId) {
+    if (projPtr < 0x10000000ULL || (projPtr & 0x7) != 0) return false;
 
-    uint8_t buf[0x28] = {0};
-    if (!readMemory(pid, arrPtr, buf, sizeof(buf))) return false;
+    uint8_t active = 0;
+    uint8_t bobber = 0;
+    int32_t aiStyle = 0;
 
-    uint64_t klass = *reinterpret_cast<uint64_t*>(&buf[0x00]);
-    uint64_t monitor = *reinterpret_cast<uint64_t*>(&buf[0x08]);
-    uint64_t len = *reinterpret_cast<uint64_t*>(&buf[0x18]);
+    if (!readVal(pid, projPtr + gOffsets.projActive, active) || active != 1) return false;
+    if (!readVal(pid, projPtr + gOffsets.projBobber, bobber) || bobber != 1) return false;
+    if (!readVal(pid, projPtr + gOffsets.projAiStyle, aiStyle) || aiStyle != 61) return false;
 
-    if (!isValidUserPtr(klass) || monitor != 0) return false;
-    if (len < 2 || len > 8) return false;
+    // Pada build ini, Projectile.ai (0x78) dan Projectile.localAI (0x84) adalah inline float[3]
+    float ai[3] = {0.0f, 0.0f, 0.0f};
+    float localAi[3] = {0.0f, 0.0f, 0.0f};
+    if (!readMemory(pid, projPtr + gOffsets.projAiInline, ai, sizeof(ai))) return false;
+    if (!readMemory(pid, projPtr + gOffsets.projLocalAiInline, localAi, sizeof(localAi))) return false;
 
-    float v0 = *reinterpret_cast<float*>(&buf[0x20]);
-    float v1 = *reinterpret_cast<float*>(&buf[0x24]);
-    if (std::isnan(v0) || std::isnan(v1) || std::isinf(v0) || std::isinf(v1)) return false;
+    // Validasi rentang nilai pelampung pancing:
+    // ai[0] = status (0.0 = mengapung, 1.0 = ditarik, 2.0 = putus)
+    if (ai[0] < -0.1f || ai[0] > 3.0f) return false;
+    // ai[1] = timer gigitan (0 saat diam, negatif saat ikan menyambar, positif saat ditarik)
+    if (ai[1] < -1000.0f || ai[1] > 1000.0f) return false;
+    // localAI[1] = ID item/crate yang tersangkut (0 saat belum ada gigitan)
+    if (localAi[1] < 0.0f || localAi[1] > 10000.0f) return false;
 
-    outKlass = stripTag(klass);
-    e0 = v0;
-    e1 = v1;
+    outAi0 = ai[0];
+    outAi1 = ai[1];
+    outItemId = static_cast<int>(localAi[1]);
     return true;
 }
 
-bool classifyAiAndLocalAi(float a0, float a1, float b0, float b1,
-                          bool& aIsAi, float& outAi0, float& outAi1, float& outLocalAi0, int& outItemId) {
-    auto isBobberState = [](float x) {
-        return std::fabs(x - 0.0f) < 0.01f || std::fabs(x - 1.0f) < 0.01f || std::fabs(x - 2.0f) < 0.01f;
-    };
+// Mode 1: Direct O(1) IL2CPP pointer chain lookup via Main.projectile[]
+bool findBobberViaPointerChain(pid_t pid, uint64_t il2cppBase, float& ai0, float& ai1, int& itemId) {
+    if (gOffsets.mainTypeInfo == 0 || il2cppBase == 0) return false;
 
-    bool aValidState = isBobberState(a0) && (a1 >= -500.0f && a1 <= 10000.0f);
-    bool bValidState = isBobberState(b0) && (b1 >= -500.0f && b1 <= 10000.0f);
+    uint64_t mainClassPtr = 0;
+    if (!readVal(pid, il2cppBase + gOffsets.mainTypeInfo, mainClassPtr) || mainClassPtr == 0) return false;
 
-    if (aValidState && b0 >= 0.0f && b0 <= 5000.0f && (!bValidState || b0 > 2.5f || a1 < 0.0f)) {
-        aIsAi = true;
-        outAi0 = a0;
-        outAi1 = a1;
-        outLocalAi0 = b0;
-        outItemId = static_cast<int>(b1);
-        return true;
-    }
-    if (bValidState && a0 >= 0.0f && a0 <= 5000.0f && (!aValidState || a0 > 2.5f || b1 < 0.0f)) {
-        aIsAi = false;
-        outAi0 = b0;
-        outAi1 = b1;
-        outLocalAi0 = a0;
-        outItemId = static_cast<int>(a1);
-        return true;
+    uint64_t staticFieldsPtr = 0;
+    if (!readVal(pid, mainClassPtr + gOffsets.staticFields, staticFieldsPtr) || staticFieldsPtr == 0) return false;
+
+    uint64_t projArrayPtr = 0;
+    if (!readVal(pid, staticFieldsPtr + gOffsets.projectileField, projArrayPtr) || projArrayPtr == 0) return false;
+
+    uint64_t arrayLen = 0;
+    if (!readVal(pid, projArrayPtr + 0x18, arrayLen) || arrayLen == 0 || arrayLen > 2000) return false;
+
+    size_t scanCount = std::min<size_t>(arrayLen, 1001);
+    std::vector<uint64_t> elements(scanCount);
+    if (!readMemory(pid, projArrayPtr + 0x20, elements.data(), scanCount * sizeof(uint64_t))) return false;
+
+    for (size_t i = 0; i < scanCount; ++i) {
+        if (validateAndReadBobber(pid, elements[i], ai0, ai1, itemId)) {
+            gCachedBobberAddr = elements[i];
+            return true;
+        }
     }
     return false;
 }
 
-bool readBobberWithKnownOffsets(pid_t pid, uint64_t projPtr,
-                                float& outAi0, float& outAi1, float& outLocalAi0, int& outItemId) {
-    if (!gLayoutDetected || !isValidUserPtr(projPtr)) return false;
-
-    int32_t aiStyle = 0;
-    if (!readVal(pid, projPtr + gOffsets.projAiStyle, aiStyle) || aiStyle != 61) return false;
-
-    uint64_t aiPtr = 0, localAiPtr = 0;
-    if (!readVal(pid, projPtr + gOffsets.projAiArray, aiPtr)) return false;
-    if (!readVal(pid, projPtr + gOffsets.projLocalAiArray, localAiPtr)) return false;
-
-    uint64_t k1 = 0, k2 = 0;
-    float ai0 = 0.0f, ai1 = 0.0f, loc0 = 0.0f, loc1 = 0.0f;
-    if (!readFloatArray(pid, aiPtr, k1, ai0, ai1)) return false;
-    if (!readFloatArray(pid, localAiPtr, k2, loc0, loc1)) return false;
-    if (k1 != k2) return false;
-
-    outAi0 = ai0;
-    outAi1 = ai1;
-    outLocalAi0 = loc0;
-    outItemId = static_cast<int>(loc1);
-    return true;
-}
-
-bool tryDiscoverFromStyleAddr(pid_t pid, uint64_t styleAddr,
-                              float& outAi0, float& outAi1, float& outLocalAi0, int& outItemId) {
-    for (uint64_t styleOff = 0x50; styleOff <= 0x380; styleOff += 4) {
-        uint64_t projPtr = styleAddr - styleOff;
-        if (!isValidIl2CppObjectHeader(pid, projPtr)) continue;
-
-        gLastProjCandidates++;
-
-        uint8_t obj[0x3A0] = {0};
-        size_t readLen = std::min<size_t>(sizeof(obj), static_cast<size_t>(styleOff + 0x20));
-        if (!readMemory(pid, projPtr, obj, readLen)) continue;
-
-        struct ArrayCand {
-            uint64_t fieldOff;
-            uint64_t klass;
-            float e0;
-            float e1;
-        };
-        std::vector<ArrayCand> arrays;
-
-        for (uint64_t off = 0x30; off + 8 <= readLen; off += 8) {
-            uint64_t ptr = *reinterpret_cast<uint64_t*>(&obj[off]);
-            uint64_t arrKlass = 0;
-            float v0 = 0.0f, v1 = 0.0f;
-            if (readFloatArray(pid, ptr, arrKlass, v0, v1)) {
-                arrays.push_back({off, arrKlass, v0, v1});
-            }
+// Mode 2: Heuristic Heap Scanner for Projectile with active == 1, bobber == 1, aiStyle == 61
+bool findBobberViaHeapScan(pid_t pid, float& ai0, float& ai1, int& itemId) {
+    // Fast path: baca langsung dari alamat bobber yang sudah terkunci
+    if (gCachedBobberAddr != 0) {
+        if (validateAndReadBobber(pid, gCachedBobberAddr, ai0, ai1, itemId)) {
+            return true;
         }
+        gCachedBobberAddr = 0;
+    }
 
-        for (size_t i = 0; i < arrays.size(); ++i) {
-            for (size_t j = i + 1; j < arrays.size(); ++j) {
-                if (arrays[i].klass != arrays[j].klass) continue;
+    auto regions = getWritableHeapRegions(pid);
+    const size_t chunkSize = 256 * 1024;
+    std::vector<uint8_t> buf(chunkSize);
 
-                bool iIsAi = false;
-                float ai0 = 0.0f, ai1 = 0.0f, loc0 = 0.0f;
-                int itemId = 0;
-                if (classifyAiAndLocalAi(arrays[i].e0, arrays[i].e1,
-                                         arrays[j].e0, arrays[j].e1,
-                                         iIsAi, ai0, ai1, loc0, itemId)) {
-                    // Hanya kunci pelampung yang sedang aktif (localAI[0] > 0 atau sedang digigit)
-                    if (loc0 > 0.5f || ai1 < -0.1f) {
-                        gOffsets.projAiStyle = styleOff;
-                        gOffsets.projAiArray = iIsAi ? arrays[i].fieldOff : arrays[j].fieldOff;
-                        gOffsets.projLocalAiArray = iIsAi ? arrays[j].fieldOff : arrays[i].fieldOff;
-                        gLayoutDetected = true;
-                        gCachedBobberAddr = projPtr;
-                        gLastLocalAi0 = loc0;
-                        gLastAi1 = ai1;
-                        gStaleTicks = 0;
+    for (const auto& reg : regions) {
+        for (uint64_t addr = reg.start; addr < reg.end; addr += chunkSize) {
+            size_t toRead = std::min<size_t>(chunkSize, reg.end - addr);
+            if (!readMemory(pid, addr, buf.data(), toRead)) continue;
 
-                        outAi0 = ai0;
-                        outAi1 = ai1;
-                        outLocalAi0 = loc0;
-                        outItemId = itemId;
+            // projAiStyle (0x98) kelipatan 8 sehingga selalu aligned
+            for (size_t off = gOffsets.projAiStyle; off + 0x40 < toRead; off += 8) {
+                int32_t candidateStyle = *reinterpret_cast<int32_t*>(&buf[off]);
+                if (candidateStyle == 61) {
+                    uint64_t candidateProj = addr + off - gOffsets.projAiStyle;
+                    if (validateAndReadBobber(pid, candidateProj, ai0, ai1, itemId)) {
+                        gCachedBobberAddr = candidateProj;
                         return true;
                     }
                 }
             }
         }
     }
-    return false;
-}
-
-bool findActiveBobber(pid_t pid, float& ai0, float& ai1, int& itemId) {
-    float loc0 = 0.0f;
-
-    if (gCachedBobberAddr != 0) {
-        if (readBobberWithKnownOffsets(pid, gCachedBobberAddr, ai0, ai1, loc0, itemId)) {
-            bool changed = (std::fabs(loc0 - gLastLocalAi0) > 0.01f) || (std::fabs(ai1 - gLastAi1) > 0.01f);
-            gLastLocalAi0 = loc0;
-            gLastAi1 = ai1;
-
-            if (changed || ai1 < -0.1f) {
-                gStaleTicks = 0;
-                return true;
-            }
-
-            // Jika angka berhenti berubah > 14 tick (~350ms), pelampung sudah ditarik/hilang
-            gStaleTicks++;
-            if (gStaleTicks <= 14) {
-                return true;
-            }
-        }
-        gCachedBobberAddr = 0;
-        gStaleTicks = 0;
-    }
-
-    auto regions = getWritableHeapRegions(pid);
-    gLastRegionCount = static_cast<int>(regions.size());
-    int hits = 0;
-    gLastProjCandidates = 0;
-
-    const size_t chunkSize = 1024 * 1024;
-    std::vector<uint8_t> buf(chunkSize);
-
-    for (const auto& reg : regions) {
-        for (uint64_t addr = reg.start; addr < reg.end; addr += chunkSize) {
-            size_t toRead = std::min<size_t>(chunkSize, static_cast<size_t>(reg.end - addr));
-            if (!readMemory(pid, addr, buf.data(), toRead)) continue;
-
-            for (size_t off = 0; off + 4 <= toRead; off += 4) {
-                int32_t val = *reinterpret_cast<int32_t*>(&buf[off]);
-                if (val == 61) {
-                    hits++;
-                    uint64_t styleAddr = addr + off;
-                    if (gLayoutDetected) {
-                        uint64_t candProj = styleAddr - gOffsets.projAiStyle;
-                        if (readBobberWithKnownOffsets(pid, candProj, ai0, ai1, loc0, itemId)) {
-                            if (loc0 > 0.5f || ai1 < -0.1f) {
-                                gCachedBobberAddr = candProj;
-                                gLastLocalAi0 = loc0;
-                                gLastAi1 = ai1;
-                                gStaleTicks = 0;
-                                gLastStyleHits = hits;
-                                return true;
-                            }
-                        }
-                    } else {
-                        if (tryDiscoverFromStyleAddr(pid, styleAddr, ai0, ai1, loc0, itemId)) {
-                            gLastStyleHits = hits;
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    gLastStyleHits = hits;
     return false;
 }
 
@@ -375,8 +235,7 @@ void processStdinCommands() {
             if (sscanf(cmd, "TAP %d %d", &x, &y) == 2) {
                 char shellCmd[96];
                 snprintf(shellCmd, sizeof(shellCmd), "input tap %d %d", x, y);
-                int rc = system(shellCmd);
-                (void)rc;
+                system(shellCmd);
             } else if (strncmp(cmd, "QUIT", 4) == 0) {
                 exit(0);
             }
@@ -392,6 +251,11 @@ int main(int argc, char** argv) {
 
     const char* pkgName = "com.and.games505.TerrariaPaid";
     if (argc >= 2) pkgName = argv[1];
+    if (argc >= 3) gOffsets.mainTypeInfo = strtoull(argv[2], nullptr, 16);
+    if (argc >= 4) gOffsets.projectileField = strtoull(argv[3], nullptr, 16);
+    if (argc >= 5) gOffsets.projAiStyle = strtoull(argv[4], nullptr, 16);
+    if (argc >= 6) gOffsets.projAiInline = strtoull(argv[5], nullptr, 16);
+    if (argc >= 7) gOffsets.projLocalAiInline = strtoull(argv[6], nullptr, 16);
 
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -411,24 +275,21 @@ int main(int argc, char** argv) {
         int itemId = 0;
         bool found = false;
 
-        if (gCachedBobberAddr != 0 || scanCooldown <= 0) {
-            found = findActiveBobber(pid, ai0, ai1, itemId);
-            scanCooldown = found ? 0 : 12;
+        if (gOffsets.mainTypeInfo != 0 && il2cppBase != 0) {
+            found = findBobberViaPointerChain(pid, il2cppBase, ai0, ai1, itemId);
         } else {
-            scanCooldown--;
+            if (gCachedBobberAddr != 0 || scanCooldown <= 0) {
+                found = findBobberViaHeapScan(pid, ai0, ai1, itemId);
+                scanCooldown = found ? 0 : 20; // Throttle scan saat idle
+            } else {
+                scanCooldown--;
+            }
         }
 
-        if (found) {
-            printf("STATUS|%d|%" PRIx64 " (off:%" PRIx64 "/%" PRIx64 "/%" PRIx64 ")|1|%.2f|%.2f|%d\n",
-                   pid, il2cppBase,
-                   gOffsets.projAiStyle, gOffsets.projAiArray, gOffsets.projLocalAiArray,
-                   ai0, ai1, itemId);
-        } else {
-            printf("STATUS|%d|%" PRIx64 " (R:%d H:%d C:%d)|0|0.0|0.0|0\n",
-                   pid, il2cppBase, gLastRegionCount, gLastStyleHits, gLastProjCandidates);
-        }
+        printf("STATUS|%d|%lx|%d|%.2f|%.2f|%d\n",
+               pid, il2cppBase, found ? 1 : 0, ai0, ai1, itemId);
 
-        usleep(25000);
+        usleep(25000); // 40 Hz polling
     }
 
     return 0;

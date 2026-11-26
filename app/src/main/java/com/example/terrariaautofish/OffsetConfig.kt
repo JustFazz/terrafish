@@ -4,11 +4,11 @@ import android.content.Context
 
 data class OffsetConfig(
     val packageName: String = "com.and.games505.TerrariaPaid",
-    val mainTypeInfoHex: String = "0x0",       // 0x0 = Auto Heap Scan; isi RVA Main_TypeInfo untuk akses instan
-    val projectileFieldHex: String = "0x168",
-    val projAiStyleHex: String = "0x94",
-    val projAiArrayHex: String = "0xB8",
-    val projLocalAiArrayHex: String = "0xC0"
+    val mainTypeInfoHex: String = "0x0",       // 0x0 = Auto Heap Scan (instan dengan cache alamat bobber)
+    val projectileFieldHex: String = "0x5B8",
+    val projAiStyleHex: String = "0x98",
+    val projAiArrayHex: String = "0x78",
+    val projLocalAiArrayHex: String = "0x84"
 ) {
     companion object {
         private const val PREFS_NAME = "terraria_mem_offsets"
