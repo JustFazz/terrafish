@@ -233,8 +233,8 @@ void processStdinCommands() {
         if (fgets(cmd, sizeof(cmd), stdin)) {
             int x = 0, y = 0;
             if (sscanf(cmd, "TAP %d %d", &x, &y) == 2) {
-                char shellCmd[96];
-                snprintf(shellCmd, sizeof(shellCmd), "input tap %d %d", x, y);
+                char shellCmd[128];
+                snprintf(shellCmd, sizeof(shellCmd), "input touchscreen tap %d %d >/dev/null 2>&1 &", x, y);
                 system(shellCmd);
             } else if (strncmp(cmd, "QUIT", 4) == 0) {
                 exit(0);
@@ -242,6 +242,7 @@ void processStdinCommands() {
         }
     }
 }
+
 
 int main(int argc, char** argv) {
     if (geteuid() != 0) {

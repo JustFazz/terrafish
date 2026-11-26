@@ -107,7 +107,7 @@ class FloatingFishService : Service() {
         }
 
         tvTelemetry = TextView(this).apply {
-            text = "Bobber: IDLE | Tangkapan: 0"
+            text = "Bobber: IDLE | Total: 0"
             setTextColor(Color.WHITE)
             textSize = 12f
             setPadding(0, 4, 0, 10)
@@ -156,7 +156,7 @@ class FloatingFishService : Service() {
             y = 100
         }
 
-        // 2. Titik Tap Lempar Kail (Geser ke area air agar tidak menyentuh tombol HUD)
+        // 2. Titik Tap Lempar Kail (Geser ke area air saat STOP, otomatis tembus sentuhan saat START)
         val markerSize = (36 * density).toInt()
         tapTargetView = TextView(this).apply {
             text = "TAP"
@@ -224,9 +224,20 @@ class FloatingFishService : Service() {
             btnStartStop.setBackgroundColor(Color.parseColor("#C62828"))
             lastActionTime = 0L
             waitingForCastSettle = false
+
+            // Buat lingkaran TAP tembus sentuhan agar input tap langsung masuk ke Terraria
+            tapTargetParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            tapTargetView.alpha = 0.45f
+            windowManager.updateViewLayout(tapTargetView, tapTargetParams)
         } else {
             btnStartStop.text = "START AUTO-FISH"
             btnStartStop.setBackgroundColor(Color.parseColor("#2E7D32"))
+
+            // Kembalikan agar lingkaran TAP bisa digeser lagi
+            tapTargetParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            tapTargetView.alpha = 1.0f
+            windowManager.updateViewLayout(tapTargetView, tapTargetParams)
         }
     }
 
@@ -259,7 +270,7 @@ class FloatingFishService : Service() {
 
             if (t.bobberFound) {
                 val itemInfo = TerrariaItemIds.getDisplayName(t.hookedItemId)
-                tvTelemetry.text = "ai[1]=${t.ai1BiteTimer} | $itemInfo | Total:$catchCount"
+                tvTelemetry.text = "ai[0]=${t.ai0State} ai[1]=${t.ai1BiteTimer} | $itemInfo | Total:$catchCount"
             } else {
                 tvTelemetry.text = "Bobber: Tidak ada di air | Total:$catchCount"
             }
@@ -274,7 +285,7 @@ class FloatingFishService : Service() {
 
         // 1. Jika tidak ada bobber di air, lempar kail otomatis
         if (!t.bobberFound) {
-            if (now - lastActionTime > 1200L) {
+            if (now - lastActionTime > 1300L) {
                 RootDaemonBridge.sendTap(tapX, tapY)
                 lastActionTime = now
                 waitingForCastSettle = true
@@ -287,10 +298,11 @@ class FloatingFishService : Service() {
         }
         waitingForCastSettle = false
 
-        // 2. Cek apakah ikan menyambar: ai[1] < 0f menandakan gigitan aktif di RAM
-        if (t.ai0State == 0f && t.ai1BiteTimer < -0.5f && now - lastActionTime > 900L) {
+        // 2. Deteksi ikan menyambar:
+        // Di Terraria, saat ikan menggigit: ai[0] berubah ke 1.0f atau ai[1] turun ke nilai negatif (< -0.5f)
+        val isBiting = (t.ai0State == 1.0f || t.ai1BiteTimer < -0.5f)
+        if (isBiting && now - lastActionTime > 900L) {
             if (crateOnlyMode) {
-                // Mode Filter Crate: abaikan ikan biasa, biarkan lepas sendiri tanpa membuang umpan
                 if (TerrariaItemIds.isCrate(t.hookedItemId)) {
                     catchCount++
                     RootDaemonBridge.sendTap(tapX, tapY)
