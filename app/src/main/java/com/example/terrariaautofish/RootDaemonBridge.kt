@@ -68,9 +68,9 @@ object RootDaemonBridge {
             readerThread = Thread {
                 try {
                     val stdout = BufferedReader(InputStreamReader(rootProcess!!.inputStream))
-                    var line: String?
-                    while (isConnected && stdout.readLine().also { line = it } != null) {
-                        val parts = line!!.split("|")
+                    while (isConnected) {
+                        val line = stdout.readLine() ?: break
+                        val parts = line.split("|")
                         if (parts.size == 7 && parts[0] == "STATUS") {
                             val telemetry = BobberTelemetry(
                                 pid = parts[1].toIntOrNull() ?: 0,
